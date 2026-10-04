@@ -227,6 +227,51 @@ function renderRollCard(r) {
       </form>` : `
       <div class="roll-retired-reason">⛔ 停用原因：${esc(r.retired_reason || '—')}</div>
       <div class="batch-meta">已贴 ${r.applied_qty} 张已标记待复核；即使集合后来恢复，本卷也不会自动解冻。</div>`}
+    ${renderUsageLedger(r)}
+  </div>`;
+}
+
+// 核销流水与更正链：原核销与每次更正均不可改；展示每笔原始数量、最新有效数量。
+// 使用中的卷可对任一笔发起更正（提交所见修订号、目标贴用/作废数、操作人、原因）。
+function renderUsageLedger(r) {
+  const usages = r.usages || [];
+  if (!usages.length) return '';
+  const rows = usages.map((u) => {
+    const changed = u.corrected;
+    const chain = (u.corrections || []).map((c) => `
+      <li class="corr-chain-item">
+        <span class="badge ${r.active ? 'active' : 'invalid'}">更正 #${c.seq}</span>
+        目标 <b>${c.target_applied_qty}</b> 贴 / <b>${c.target_void_qty}</b> 作废
+        <span class="batch-meta">· 所见修订号 ${c.expected_revision} · ${esc(fmtTime(c.corrected_at))} · ${esc(c.corrected_by)}</span>
+        <div class="corr-reason">原因：${esc(c.reason)}</div>
+      </li>`).join('');
+    return `
+    <div class="usage-row">
+      <div class="usage-head">
+        <span class="batch-meta">核销 #${u.id} · ${esc(fmtTime(u.used_at))} · ${esc(u.used_by)}</span>
+        <span class="usage-qty ${changed ? 'changed' : ''}">
+          原始 ${u.original_applied_qty} 贴 / ${u.original_void_qty} 作废
+          ${changed ? `→ <b>有效 ${u.applied_qty} / ${u.void_qty}</b>
+             <span class="badge invalid">已更正 ×${u.correction_count}</span>` : '<span class="badge active">未更正</span>'}
+        </span>
+      </div>
+      ${chain ? `<ul class="corr-chain">${chain}</ul>` : ''}
+      ${r.active ? `
+      <form class="correct-form" data-roll-id="${r.id}" data-usage-id="${u.id}">
+        <input type="hidden" name="expected_revision" value="${r.revision}">
+        <span class="batch-meta">更正本笔（修订号 ${r.revision}）：</span>
+        <label>目标贴用 <input type="number" name="target_applied_qty" min="0" step="1" value="${u.applied_qty}"></label>
+        <label>目标作废 <input type="number" name="target_void_qty" min="0" step="1" value="${u.void_qty}"></label>
+        <label>操作人 <input type="text" name="corrected_by" placeholder="姓名/工号" class="consume-by"></label>
+        <label class="corr-reason-input">原因 <input type="text" name="reason" placeholder="必填，如：盘点发现少录" required></label>
+        <button type="submit" class="btn small">提交更正</button>
+      </form>` : ''}
+    </div>`;
+  }).join('');
+  return `
+  <div class="usage-ledger">
+    <div class="usage-ledger-title">核销流水与更正链（卷累计按各笔最新有效数量计算）</div>
+    ${rows}
   </div>`;
 }
 
@@ -958,6 +1003,32 @@ $('#rollList').addEventListener('submit', async (e) => {
     notice('ok', `核销成功：${r.roll_code} 新修订号 ${r.revision}，剩余可贴 ${r.remaining_qty} 张`);
   } catch (err) {
     notice('error', err.error || '核销被拒绝', err.details);
+    await refresh(); // 修订号可能已被他人推进，刷新表单
+  }
+});
+
+// 核销更正（事件委托，动态表单也生效）：成功后修订号 +1，卷累计/可出货余额同步刷新
+$('#rollList').addEventListener('submit', async (e) => {
+  const form = e.target.closest('.correct-form');
+  if (!form) return;
+  e.preventDefault();
+  const rollId = form.dataset.rollId;
+  const usageId = form.dataset.usageId;
+  const body = {
+    expected_revision: parseInt(form.expected_revision.value, 10),
+    target_applied_qty: parseInt(form.target_applied_qty.value, 10),
+    target_void_qty: parseInt(form.target_void_qty.value, 10),
+    corrected_by: form.corrected_by.value,
+    reason: form.reason.value
+  };
+  try {
+    const r = await api(`/api/label-rolls/${rollId}/usages/${usageId}/corrections`,
+      { method: 'POST', body });
+    await refresh();
+    notice('ok', `更正成功：该笔有效数量 ${r.usage.applied_qty} 贴 / ${r.usage.void_qty} 作废，` +
+      `${r.roll.roll_code} 新修订号 ${r.roll.revision}，剩余 ${r.roll.remaining_qty} 张`);
+  } catch (err) {
+    notice('error', err.error || '更正被拒绝', err.details);
     await refresh(); // 修订号可能已被他人推进，刷新表单
   }
 });

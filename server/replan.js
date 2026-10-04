@@ -758,6 +758,8 @@ function openShadow(sourceDb) {
   copy('releases', 'id,batch_id,released_at,released_by,snapshot_allergens,status,invalid_reason,created_event_seq');
   copy('label_rolls', 'id,roll_code,batch_id,release_id,print_qty,applied_qty,void_qty,revision,allergen_set,registered_at,registered_by,status,retired_reason');
   copy('label_roll_usages', 'id,roll_id,used_at,applied_qty,void_qty,expected_revision,used_by');
+  // 核销更正流水一并拷入影子库（只读一致性；预演本身不提供更正操作）。
+  copy('label_usage_corrections', 'id,usage_id,roll_id,seq,target_applied_qty,target_void_qty,expected_revision,corrected_by,reason,corrected_at');
   copy('shipments', 'id,shipment_code,batch_id,batch_code,ship_qty,allergen_set,status,review_reason,shipped_at,shipped_by,created_at');
   copy('shipment_items', 'id,shipment_id,roll_id,roll_code,release_id,release_at,release_by,allergen_set,roll_revision,qty');
   copy('shipment_dispositions', 'id,shipment_id,decision,decided_by,basis,expected_version,context_hash,context_snapshot,status_version,life_status,stale_reason,decided_at,created_at');

@@ -141,6 +141,27 @@ function initSchema(d) {
     used_by TEXT NOT NULL DEFAULT ''
   );
 
+  -- 核销更正流水（只增不改）：仓管发现核销录错时，对同一卷的一笔核销流水
+  --   （label_roll_usages 行，即“原核销编号”）提交更正，给出该笔的目标贴用/作废数。
+  --   本表行永不 UPDATE/DELETE；原核销行同样保留原样。每笔核销的最新有效数量 =
+  --   其最后一条更正（seq 最大）的目标数量；无更正时即原核销数量。
+  --   卷累计贴用/作废按各笔最新有效数量重算；每次成功更正卷修订号 +1（expected_revision
+  --   记录更正前客户端所见修订号，旧修订号整次拒绝且不推进）。
+  --   历史出货分配（shipment_items）及其快照不随更正改动；更正后累计贴用不得低于该卷
+  --   已分配出货张数、贴用与作废之和不得超过印量，否则整次拒绝。
+  CREATE TABLE IF NOT EXISTS label_usage_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    usage_id INTEGER NOT NULL REFERENCES label_roll_usages(id) ON DELETE CASCADE,
+    roll_id INTEGER NOT NULL REFERENCES label_rolls(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,                   -- 该笔核销的更正序号（1 起，按 id 递增补发）
+    target_applied_qty INTEGER NOT NULL CHECK (target_applied_qty >= 0),
+    target_void_qty INTEGER NOT NULL CHECK (target_void_qty >= 0),
+    expected_revision INTEGER NOT NULL,     -- 更正提交时客户端所见卷修订号
+    corrected_by TEXT NOT NULL DEFAULT '',  -- 操作人
+    reason TEXT NOT NULL,                   -- 更正原因（必填留痕）
+    corrected_at TEXT NOT NULL
+  );
+
   -- 包装出货单：按批次把已贴用标签按卷分配给出货单（整单事务化，任一条件不满足即拒绝且不占数量）。
   -- 单据只增不改：批次/放行后续更正、放行删除均不删除出货记录，仅置为“待评估”（PENDING_REVIEW，终态不自动恢复）。
   CREATE TABLE IF NOT EXISTS shipments (
@@ -325,6 +346,8 @@ function initSchema(d) {
   CREATE INDEX IF NOT EXISTS idx_releases_batch ON releases(batch_id);
   CREATE INDEX IF NOT EXISTS idx_label_rolls_batch ON label_rolls(batch_id);
   CREATE INDEX IF NOT EXISTS idx_label_usages_roll ON label_roll_usages(roll_id);
+  CREATE INDEX IF NOT EXISTS idx_label_corrections_usage ON label_usage_corrections(usage_id);
+  CREATE INDEX IF NOT EXISTS idx_label_corrections_roll ON label_usage_corrections(roll_id);
   CREATE INDEX IF NOT EXISTS idx_shipments_batch ON shipments(batch_id);
   CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(status);
   CREATE INDEX IF NOT EXISTS idx_shipment_items_shipment ON shipment_items(shipment_id);

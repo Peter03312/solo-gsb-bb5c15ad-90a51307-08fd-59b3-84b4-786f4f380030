@@ -8,6 +8,14 @@
 // 核销：每卷凭“预期修订号”核销贴用与作废张数，累计不得超过印量。
 //   旧修订号、负数、超量均整次拒绝（事务回滚，修订号不前进）。
 //
+// 核销更正（仓管纠错）：对同一卷已存在的一笔核销流水（原核销编号）提交更正，
+//   给出该笔的目标贴用数/作废数（非负整数，允许均为 0）。原核销行与每次更正行均为
+//   只增不改流水；每笔的“最新有效数量”取其最后一次更正目标，卷累计贴用/作废按各笔
+//   最新有效数量重算。更正后：累计贴用不得低于该卷已分配出货张数（历史出货分配与
+//   快照不改），贴用+作废不得超过印量。未知/跨卷原核销、非法数量、旧修订号、
+//   永久停用或质量隔离暂停贴用的卷均整次拒绝（修订号不前进）；成功后修订号 +1，
+//   卷剩余量与可出货余额随最新有效数量同步更新。
+//
 // 永久停用：原料或加工事件变更、换线整组确认应用使集合改变，或绑定放行失效/删除时，
 //   该卷永久停用（RETIRED，终态）：已贴数量标记待复核，余量不可再贴；
 //   即使集合后来恢复也不自动解冻。
@@ -189,6 +197,157 @@ function consumeRoll(db, id, body) {
   return result;
 }
 
+// ---------- 核销更正（仓管对已录错的一笔核销进行纠错）----------
+// rollId 可空：为空时只按 usage_id 定位原核销（原核销所属卷即更正对象）；
+// 非空时若原核销属于其他卷，按“跨卷核销”整次拒绝。
+// body: { expected_revision, target_applied_qty / applied, target_void_qty / voided,
+//         corrected_by / operator, reason, corrected_at? }
+function correctUsage(db, rollId, usageId, body) {
+  const usage_id = parseInt(usageId, 10);
+  if (!Number.isInteger(usage_id)) throw new LabelError('INVALID_REQUEST', '原核销编号不合法');
+  if (rollId != null) {
+    rollId = parseInt(rollId, 10);
+    if (!Number.isInteger(rollId)) throw new LabelError('INVALID_REQUEST', '卷号不合法');
+  }
+  const bodyUsageId = body && body.usage_id != null ? parseInt(body.usage_id, 10) : null;
+  if (bodyUsageId != null) {
+    if (!Number.isInteger(bodyUsageId)) {
+      throw new LabelError('INVALID_REQUEST', 'body.usage_id 不合法');
+    }
+    if (bodyUsageId !== usage_id) {
+      throw new LabelError(
+        'USAGE_MISMATCH',
+        `路径原核销编号 ${usage_id} 与请求体 usage_id ${bodyUsageId} 不一致，整次拒绝`
+      );
+    }
+  }
+
+  const expected_revision = parseInt(body && body.expected_revision, 10);
+  if (!Number.isInteger(expected_revision) || expected_revision < 0) {
+    throw new LabelError('INVALID_REQUEST', '请提供所见卷修订号（非负整数）');
+  }
+  const targetApplied = intNonNeg(
+    body && body.target_applied_qty != null ? body.target_applied_qty : body && body.applied,
+    '目标贴用数'
+  );
+  const targetVoid = intNonNeg(
+    body && body.target_void_qty != null ? body.target_void_qty : body && body.voided,
+    '目标作废数'
+  );
+  if (targetApplied > 1e9 || targetVoid > 1e9) {
+    throw new LabelError('INVALID_REQUEST', '目标数量超出允许范围');
+  }
+  const corrected_by = String(
+    (body && (body.corrected_by || body.operator)) || ''
+  ).trim() || '未署名';
+  const reason = String((body && body.reason) || '').trim();
+  if (!reason) throw new LabelError('INVALID_REQUEST', '请录入更正原因');
+  const corrected_at = String((body && body.corrected_at) || '').trim();
+  if (corrected_at && !TIME_RE.test(corrected_at)) {
+    throw new LabelError('INVALID_REQUEST', '更正时间格式应为 YYYY-MM-DDTHH:MM');
+  }
+
+  let result;
+  const tx = db.transaction(() => {
+    // 事务内权威复核（最新数据 + 锁内串行）。
+    const usage = db.prepare('SELECT * FROM label_roll_usages WHERE id = ?').get(usage_id);
+    if (!usage) throw new LabelError('USAGE_NOT_FOUND', `原核销编号 ${usage_id} 不存在，整次拒绝`);
+    if (rollId != null && usage.roll_id !== rollId) {
+      const other = db.prepare('SELECT roll_code FROM label_rolls WHERE id = ?').get(usage.roll_id);
+      throw new LabelError(
+        'USAGE_CROSS_ROLL',
+        `跨卷核销：原核销编号 ${usage_id} 属于卷 ${other ? other.roll_code : '#' + usage.roll_id}，` +
+        `不属于卷 #${rollId}，整次拒绝`
+      );
+    }
+    const cur = db.prepare('SELECT * FROM label_rolls WHERE id = ?').get(usage.roll_id);
+    if (!cur) throw new LabelError('ROLL_NOT_FOUND', '标签卷不存在');
+    if (cur.status !== 'ACTIVE') {
+      throw new LabelError(
+        'ROLL_RETIRED',
+        `该卷已永久停用（${cur.retired_reason || '见停用原因'}），不可更正`,
+        [cur.retired_reason]
+      );
+    }
+    // 质量隔离令：所属批次受控时暂停贴用，期间同样不允许更正（脱离全部生效令后恢复）。
+    const quarantine = require('./quarantine');
+    const qOrders = quarantine.batchOrders(db, cur.batch_id);
+    if (qOrders.length) {
+      throw new LabelError(
+        'ROLL_QUARANTINED',
+        `卷 ${cur.roll_code} 所属批次处于质量隔离令生效范围（${quarantine.describeOrders(qOrders)}），` +
+        '已暂停贴用，期间不可更正；解除隔离或流向变化脱离全部生效令后恢复'
+      );
+    }
+    if (cur.revision !== expected_revision) {
+      throw new LabelError(
+        'REVISION_MISMATCH',
+        `修订号已过期：卷当前修订号为 ${cur.revision}，提交的所见修订号为 ${expected_revision}；整次拒绝`
+      );
+    }
+
+    // 该笔当前有效数量（取最后一条更正目标；无更正即原核销数量）。
+    const last = db.prepare(
+      'SELECT target_applied_qty, target_void_qty FROM label_usage_corrections WHERE usage_id = ? ORDER BY id DESC LIMIT 1'
+    ).get(usage_id);
+    const effApplied = last ? last.target_applied_qty : usage.applied_qty;
+    const effVoid = last ? last.target_void_qty : usage.void_qty;
+
+    // 卷累计 = 各笔最新有效数量之和；用“目标值 - 当前有效值”调整本卷累计。
+    const nextApplied = cur.applied_qty - effApplied + targetApplied;
+    const nextVoid = cur.void_qty - effVoid + targetVoid;
+    if (nextApplied < 0 || nextVoid < 0) {
+      // 正常不可达（各笔有效数量非负，其和即卷累计），防御性兜底。
+      throw new LabelError('INVALID_REQUEST', '更正后卷累计出现负数，整次拒绝');
+    }
+
+    // 历史出货分配与快照不改：累计贴用不得低于该卷已分配出货张数。
+    const allocRow = db.prepare(
+      'SELECT COALESCE(SUM(qty),0) AS allocated FROM shipment_items WHERE roll_id = ?'
+    ).get(cur.id);
+    const allocated = allocRow.allocated;
+    if (nextApplied < allocated) {
+      throw new LabelError(
+        'APPLIED_BELOW_ALLOCATED',
+        `更正后卷 ${cur.roll_code} 累计贴用将为 ${nextApplied} 张，低于该卷已分配出货张数 ${allocated} 张；` +
+        '历史出货分配不可更改，整次拒绝',
+        [`目标贴用数 ${targetApplied}`, `已分配出货 ${allocated}`]
+      );
+    }
+    if (nextApplied + nextVoid > cur.print_qty) {
+      throw new LabelError(
+        'OVER_LIMIT',
+        `更正后超过印量：卷 ${cur.roll_code} 印量 ${cur.print_qty}，按各笔最新有效数量计 ` +
+        `累计贴用 ${nextApplied}、作废 ${nextVoid}（合计 ${nextApplied + nextVoid}）超过印量；整次拒绝`
+      );
+    }
+
+    const seq = (db.prepare(
+      'SELECT COALESCE(MAX(seq),0) + 1 AS seq FROM label_usage_corrections WHERE usage_id = ?'
+    ).get(usage_id).seq);
+    db.prepare(
+      `INSERT INTO label_usage_corrections
+         (usage_id, roll_id, seq, target_applied_qty, target_void_qty,
+          expected_revision, corrected_by, reason, corrected_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`
+    ).run(usage_id, cur.id, seq, targetApplied, targetVoid,
+          expected_revision, corrected_by, reason, corrected_at || null);
+    db.prepare(
+      'UPDATE label_rolls SET applied_qty = ?, void_qty = ?, revision = revision + 1 WHERE id = ?'
+    ).run(nextApplied, nextVoid, cur.id);
+
+    result = {
+      roll: formatRoll(db.prepare('SELECT * FROM label_rolls WHERE id = ?').get(cur.id)),
+      usage: getUsage(db, usage_id),
+      correction: formatCorrection(db.prepare(
+        'SELECT * FROM label_usage_corrections WHERE usage_id = ? ORDER BY id DESC LIMIT 1'
+      ).get(usage_id))
+    };
+  });
+  tx();
+  return result;
+}
+
 // ---------- 终态停用 ----------
 function deactivateRolls(db, ids, reason) {
   const list = Array.isArray(ids) ? ids : [ids];
@@ -288,6 +447,57 @@ function syncRollsAfterRecompute(db, batchResult) {
 }
 
 // ---------- 读取模型 ----------
+function formatCorrection(c) {
+  if (!c) return null;
+  return {
+    id: c.id,
+    usage_id: c.usage_id,
+    roll_id: c.roll_id,
+    seq: c.seq,
+    target_applied_qty: c.target_applied_qty,
+    target_void_qty: c.target_void_qty,
+    expected_revision: c.expected_revision,
+    corrected_by: c.corrected_by,
+    reason: c.reason,
+    corrected_at: c.corrected_at
+  };
+}
+
+// 一笔核销流水：原始数量、最新有效数量（取最后一次更正目标）与更正链（只增不改）。
+function formatUsage(db, u) {
+  if (!u) return null;
+  const corrections = db.prepare(
+    `SELECT * FROM label_usage_corrections WHERE usage_id = ? ORDER BY id`
+  ).all(u.id).map(formatCorrection);
+  const last = corrections.length ? corrections[corrections.length - 1] : null;
+  return {
+    id: u.id,
+    roll_id: u.roll_id,
+    used_at: u.used_at,
+    used_by: u.used_by,
+    expected_revision: u.expected_revision, // 原核销提交时所见修订号
+    original_applied_qty: u.applied_qty,
+    original_void_qty: u.void_qty,
+    corrected: corrections.length > 0,
+    correction_count: corrections.length,
+    // 最新有效数量：有更正取最后一次更正目标，否则即原核销数量。
+    applied_qty: last ? last.target_applied_qty : u.applied_qty,
+    void_qty: last ? last.target_void_qty : u.void_qty,
+    corrections
+  };
+}
+
+function getUsage(db, id) {
+  const u = db.prepare('SELECT * FROM label_roll_usages WHERE id = ?').get(id);
+  return formatUsage(db, u);
+}
+
+function listUsages(db, rollId) {
+  return db.prepare(
+    'SELECT * FROM label_roll_usages WHERE roll_id = ? ORDER BY id'
+  ).all(rollId).map((u) => formatUsage(db, u));
+}
+
 function formatRoll(r) {
   if (!r) return null;
   const applied = r.applied_qty || 0;
@@ -317,8 +527,13 @@ module.exports = {
   LabelError,
   registerRoll,
   consumeRoll,
+  correctUsage,
+  getUsage,
+  listUsages,
   deactivateForReleaseDeletion,
   deactivateForBatchDeletion,
   syncRollsAfterRecompute,
-  formatRoll
+  formatRoll,
+  formatUsage,
+  formatCorrection
 };

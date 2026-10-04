@@ -199,6 +199,27 @@ details summary { cursor: pointer; color: var(--primary); font-size: 12.5px; mar
 .consume-form .consume-by { width: 130px; padding: 5px 8px; border: 1px solid #cdd7e0; border-radius: 6px; }
 .roll-retired-reason { color: var(--danger); font-size: 12.5px; font-weight: 600; margin-bottom: 4px; }
 
+/* 核销流水与更正链 */
+.usage-ledger { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; }
+.usage-ledger-title { font-size: 12.5px; font-weight: 600; color: #2b3c50; margin-bottom: 6px; }
+.usage-row { border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; margin-bottom: 6px; background: #fff; }
+.usage-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: center; }
+.usage-qty { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.usage-qty.changed b { color: var(--danger); }
+.corr-chain { list-style: none; margin: 6px 0 2px; padding: 6px 10px; background: var(--danger-bg); border-radius: 6px; }
+.corr-chain-item { font-size: 12.5px; color: #33475b; padding: 3px 0; font-variant-numeric: tabular-nums; }
+.corr-chain-item + .corr-chain-item { border-top: 1px dotted #e3b3ac; }
+.corr-reason { color: var(--muted); margin-top: 1px; }
+.correct-form {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  border-top: 1px dashed var(--line); padding-top: 8px; margin-top: 7px;
+}
+.correct-form label { font-size: 12.5px; color: #33475b; display: flex; align-items: center; gap: 5px; }
+.correct-form input[type=number] { width: 74px; padding: 5px 8px; border: 1px solid #cdd7e0; border-radius: 6px; }
+.correct-form .consume-by { width: 130px; padding: 5px 8px; border: 1px solid #cdd7e0; border-radius: 6px; }
+.correct-form .corr-reason-input { flex: 1 1 220px; }
+.correct-form .corr-reason-input input { flex: 1; min-width: 160px; padding: 5px 8px; border: 1px solid #cdd7e0; border-radius: 6px; }
+
 @media (max-width: 860px) { .base-grid { grid-template-columns: 1fr; } }
 
 /* ---------- 包装出货 ---------- */

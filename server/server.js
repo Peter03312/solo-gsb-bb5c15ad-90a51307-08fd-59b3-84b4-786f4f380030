@@ -235,6 +235,8 @@ app.get('/api/state', (req, res) => {
     release_at: r.release_at,
     release_by: r.release_by,
     allocated_qty: r.allocated_qty || 0,
+    // 每笔核销流水：原始数量、最新有效数量与更正链（更正只增不改，累计按最新有效数量计）。
+    usages: labels.listUsages(db, r.id),
     // 可出货余额：仅未停用卷的“已贴用 - 累计已分配”；停卷余量冻结不可出货。
     // 质量隔离令：所属批次被任一生效令覆盖时逐卷可出货量按 0（与余额接口/出货入口一致），
     // 已贴用数、已分配数与卷状态均保留原值。
@@ -978,12 +980,55 @@ app.post('/api/label-rolls/:id/consume', (req, res) => {
   } catch (err) { sendLabelError(res, err); }
 });
 
+// 核销更正（同一标签卷的一笔贴用/作废记录录错后由仓管更正）：
+// body { expected_revision, target_applied_qty|applied, target_void_qty|voided,
+//        corrected_by|operator, reason, corrected_at? }
+// 未知/跨卷原核销、非法数量、旧修订号、永久停用或质量隔离暂停贴用均整次拒绝（修订号不前进）；
+// 成功后卷修订号 +1，返回 { roll, usage, correction }。
+app.post('/api/label-rolls/:id/usages/:usageId/corrections', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '卷号不合法' });
+  try {
+    res.json(labels.correctUsage(db, id, req.params.usageId, req.body || {}));
+  } catch (err) { sendLabelError(res, err); }
+});
+
+// 不指定卷的更正入口：原核销编号定位其所属卷（body.usage_id 可省略，默认取路径值）。
+app.post('/api/label-usages/:usageId/corrections', (req, res) => {
+  try {
+    const body = { ...(req.body || {}) };
+    if (body.usage_id == null) body.usage_id = req.params.usageId;
+    res.json(labels.correctUsage(db, null, req.params.usageId, body));
+  } catch (err) { sendLabelError(res, err); }
+});
+
+// 查询一卷的核销流水：每笔含原始数量、最新有效数量与完整更正链。
+app.get('/api/label-rolls/:id/usages', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '卷号不合法' });
+  const roll = db.prepare('SELECT id, roll_code FROM label_rolls WHERE id = ?').get(id);
+  if (!roll) return res.status(404).json({ error: '标签卷不存在', code: 'ROLL_NOT_FOUND' });
+  res.json({ roll_id: roll.id, roll_code: roll.roll_code, usages: labels.listUsages(db, id) });
+});
+
+// 查询单笔核销（含更正链与该笔最新有效数量）。
+app.get('/api/label-usages/:usageId', (req, res) => {
+  const id = parseInt(req.params.usageId, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '原核销编号不合法' });
+  const usage = labels.getUsage(db, id);
+  if (!usage) return res.status(404).json({ error: '原核销记录不存在', code: 'USAGE_NOT_FOUND' });
+  const roll = db.prepare('SELECT roll_code FROM label_rolls WHERE id = ?').get(usage.roll_id);
+  res.json({ ...usage, roll_code: roll ? roll.roll_code : null });
+});
+
 function sendLabelError(res, err) {
   if (err && err.name === 'LabelError') {
     const status = (err.code === 'REVISION_MISMATCH' || err.code === 'OVER_LIMIT' ||
       err.code === 'ROLL_RETIRED' || err.code === 'BATCH_QUARANTINED' ||
-      err.code === 'ROLL_QUARANTINED') ? 409 : 400;
-    if (err.code === 'ROLL_NOT_FOUND') return res.status(404).json({ error: err.message, code: err.code });
+      err.code === 'ROLL_QUARANTINED' || err.code === 'APPLIED_BELOW_ALLOCATED') ? 409 : 400;
+    if (err.code === 'ROLL_NOT_FOUND' || err.code === 'USAGE_NOT_FOUND') {
+      return res.status(404).json({ error: err.message, code: err.code, details: err.details });
+    }
     return res.status(status).json({
       error: err.message,
       code: err.code,
