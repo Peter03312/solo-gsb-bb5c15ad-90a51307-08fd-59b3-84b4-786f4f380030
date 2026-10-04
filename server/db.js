@@ -141,6 +141,22 @@ function initSchema(d) {
     used_by TEXT NOT NULL DEFAULT ''
   );
 
+  -- 核销更正流水（只增不改）：仓管对同一标签卷某一笔贴用/作废流水的更正。
+  --   每次更正保存提交时所见卷修订号（expected_revision，乐观并发）与目标贴用/作废张数；
+  --   原核销行与历次更正行均永不 UPDATE/DELETE，每笔以最后一次更正的目标数为“最新有效数量”。
+  --   roll_id 冗余存证并用于跨卷核对：更正必须与原核销属于同一卷（USAGE_ROLL_MISMATCH 整次拒绝）。
+  CREATE TABLE IF NOT EXISTS label_roll_usage_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    usage_id INTEGER NOT NULL REFERENCES label_roll_usages(id) ON DELETE CASCADE,
+    roll_id INTEGER NOT NULL REFERENCES label_rolls(id) ON DELETE CASCADE,
+    target_applied_qty INTEGER NOT NULL CHECK (target_applied_qty >= 0), -- 目标贴用（非负整数）
+    target_void_qty INTEGER NOT NULL CHECK (target_void_qty >= 0),       -- 目标作废（非负整数）
+    expected_revision INTEGER NOT NULL,     -- 提交时所见卷修订号（旧号整次拒绝、不推进）
+    corrected_by TEXT NOT NULL DEFAULT '',  -- 操作人
+    reason TEXT NOT NULL DEFAULT '',        -- 更正原因
+    corrected_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   -- 包装出货单：按批次把已贴用标签按卷分配给出货单（整单事务化，任一条件不满足即拒绝且不占数量）。
   -- 单据只增不改：批次/放行后续更正、放行删除均不删除出货记录，仅置为“待评估”（PENDING_REVIEW，终态不自动恢复）。
   CREATE TABLE IF NOT EXISTS shipments (
@@ -325,6 +341,8 @@ function initSchema(d) {
   CREATE INDEX IF NOT EXISTS idx_releases_batch ON releases(batch_id);
   CREATE INDEX IF NOT EXISTS idx_label_rolls_batch ON label_rolls(batch_id);
   CREATE INDEX IF NOT EXISTS idx_label_usages_roll ON label_roll_usages(roll_id);
+  CREATE INDEX IF NOT EXISTS idx_label_usage_corr_usage ON label_roll_usage_corrections(usage_id);
+  CREATE INDEX IF NOT EXISTS idx_label_usage_corr_roll ON label_roll_usage_corrections(roll_id);
   CREATE INDEX IF NOT EXISTS idx_shipments_batch ON shipments(batch_id);
   CREATE INDEX IF NOT EXISTS idx_shipments_status ON shipments(status);
   CREATE INDEX IF NOT EXISTS idx_shipment_items_shipment ON shipment_items(shipment_id);

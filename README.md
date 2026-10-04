@@ -335,6 +335,92 @@ curl -s -X DELETE http://localhost:3000/api/releases/1
 | 核销：负数、全零、缺少修订号、卷号不合法 | 400 | `INVALID_REQUEST` |
 | 核销不存在的卷 | 404 | `ROLL_NOT_FOUND` |
 
+### 核销更正（录错后由仓管更正同一标签卷的一笔贴用/作废记录）
+
+核销录错后，**仓管可对同一标签卷的某一笔贴用/作废记录提交更正**，而不是补一笔核销：
+
+- 必须提交：**原核销编号**（`usage_id`，即核销流水行 id，路径参数即可）、
+  **所见卷修订号**（`expected_revision`）、**目标贴用数**与**目标作废数**（均为非负整数，允许与现值相同）、
+  **操作人**（`corrected_by`，缺省记“未署名”）与**更正原因**（`reason`，必填）；更正时间 `corrected_at` 可选。
+  目标数量字段也可写作 `applied`/`used`、`voided`/`void_qty`（兼容既有字段习惯）。
+- **原核销记录与每次更正均为不可改流水**（只增不改）：查询返回**更正链**
+  （`correction_chain`：首项 `ORIGINAL` 为原核销，其后每项 `CORRECTION` 为一次更正）与该笔
+  **最新有效数量**（`latest_applied_qty`/`latest_void_qty`，即最后一次更正的目标数；无更正时等于原数）。
+- **卷累计贴用、作废及剩余量按各笔最新有效数量计算**；更正成功后**卷修订号 +1**，
+  **可出货余额同步更新**（既有核销、出货接口与字段语义保持不变）。
+- 更正后**累计贴用不得低于该卷已分配出货张数**（历史出货分配及明细快照不改，等于已分配数允许），
+  **累计贴用与作废之和不得超过印量**（恰好等于印量允许）。
+- **已永久停用（`RETIRED`）或因质量隔离暂停贴用的卷不可更正**；
+  隔离解除或流向变化脱离全部生效令后可恢复更正。
+- **未知或跨卷核销、非法数量（负数/非整数/缺目标字段）、缺少原因、旧修订号**均**整次拒绝**，
+  事务回滚、**不推进修订号**。
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /api/label-rolls/:id/usages/:usageId/correct` | 更正同一卷的一笔核销；成功返回 `{ correction, usage, roll }`（`usage` 含更正链与最新有效数量，`roll` 为重算后的卷对象） |
+| `GET /api/label-rolls/:id/usages` | 该卷全部核销记录：原核销（只增不改）、每条的 `corrections`/`correction_chain`、最新有效数量；另含 `latest_totals`（各笔最新有效数量合计）与 `allocated_qty`（已分配出货张数） |
+| `GET /api/label-rolls/:id/usages/:usageId` | 单笔核销记录及其更正链；跨卷访问返回 `400 USAGE_ROLL_MISMATCH` |
+
+更正请求体：
+
+```json
+{ "expected_revision": 2,
+  "target_applied": 30, "target_voided": 0,
+  "corrected_by": "仓管-周九",
+  "reason": "核销录错：实贴 30 张，2 张作废为误录",
+  "corrected_at": "2026-10-04T08:30" }
+```
+
+#### 调用示例（curl，基于演示数据；LABEL-0001：印 500，两笔核销 100/3 与 20/2，已分配出货 100）
+
+```bash
+# 1) 查看整卷核销流水（usage_id 即每笔 id；无更正时最新有效数量=原数）
+curl -s http://localhost:3000/api/label-rolls/1/usages
+# -> { roll:{...,"applied_qty":120,"void_qty":5,"remaining_qty":375,"revision":2},
+#      allocated_qty:100, latest_totals:{applied:120,void:5},
+#      usages:[{id:1, applied_qty:100, void_qty:3, corrected:false,
+#               latest_applied_qty:100, latest_void_qty:3, correction_chain:[...]}, ...] }
+
+# 2) 把第 2 笔（原 20/2）更正为 30/0：卷按最新有效数量重算为 130 贴 / 3 作废，修订号 2 -> 3
+curl -s -X POST http://localhost:3000/api/label-rolls/1/usages/2/correct \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2,"target_applied":30,"target_voided":0,
+       "corrected_by":"仓管-周九","reason":"核销录错：实贴30，作废2为误录"}'
+# -> { correction:{ id:1, usage_id:2, target_applied_qty:30, target_void_qty:0,
+#                   expected_revision:2, corrected_by:"仓管-周九", reason:"...", ... },
+#      usage:{ id:2, applied_qty:20, void_qty:2,                # 原核销永不改
+#              latest_applied_qty:30, latest_void_qty:0,       # 最新有效数量
+#              correction_count:1, correction_chain:[ORIGINAL, CORRECTION] },
+#      roll:{ applied_qty:130, void_qty:3, remaining_qty:367, revision:3 } }
+
+# 3) 同一笔可再次更正：每次留痕，以最后一次目标数为准（原更正行保留）
+curl -s -X POST http://localhost:3000/api/label-rolls/1/usages/2/correct \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":3,"target_applied":40,"target_voided":0,"reason":"盘点复核为40"}'
+
+# 4) 旧修订号 -> 409 REVISION_MISMATCH，整次拒绝、修订号不前进
+curl -s -X POST http://localhost:3000/api/label-rolls/1/usages/2/correct \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2,"target_applied":41,"target_voided":0,"reason":"旧号重试"}'
+
+# 5) 更正后累计贴用低于已分配出货（100） -> 409 BELOW_ALLOCATED；历史出货分配与快照不改
+curl -s -X POST http://localhost:3000/api/label-rolls/1/usages/1/correct \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":4,"target_applied":50,"target_voided":3,"reason":"试改"}'
+# -> { error:"更正后该卷累计贴用为 90 张，低于已分配出货 100 张；历史出货分配不改，整次拒绝",
+#      code:"BELOW_ALLOCATED" }
+
+# 6) 贴用+作废超印量 -> 409 OVER_LIMIT（恰好等于印量允许）
+# 7) 未知/跨卷核销 -> 404 USAGE_NOT_FOUND / 400 USAGE_ROLL_MISMATCH
+curl -s http://localhost:3000/api/label-rolls/1/usages/2   # 单笔查询更正链
+```
+
+| 场景 | HTTP | `code` |
+| --- | --- | --- |
+| 未知原核销编号、卷不存在 | 404 | `USAGE_NOT_FOUND` / `ROLL_NOT_FOUND` |
+| 跨卷更正/查询、目标数量非法（负数/非整数/缺字段）、缺更正原因、修订号不合法、时间格式错 | 400 | `USAGE_ROLL_MISMATCH` / `INVALID_REQUEST` |
+| 旧修订号、更正后低于已分配出货、更正后超印量、卷已永久停用、质量隔离暂停贴用 | 409 | `REVISION_MISMATCH` / `BELOW_ALLOCATED` / `OVER_LIMIT` / `ROLL_RETIRED` / `ROLL_QUARANTINED` |
+
 ## 包装出货（按批次把已贴用标签分配给出货单）
 
 包装出货时，按**批次**把若干**已贴用标签卷**的张数一次性分配给一张出货单：
@@ -1091,6 +1177,7 @@ curl -s -X DELETE http://localhost:3000/api/downtime-windows/3
 | `GET /api/batches/:id/shipment-balance`、`GET /api/shipment-balances` | 受控批次余额响应 `quarantined:true`、逐卷 `available_qty` 与批次 `shippable_qty` 均为 0；既有字段（含已贴用/已分配/卷状态）与批次不存在时的错误保持不变 |
 | `POST /api/releases`、`POST /api/label-rolls`、`POST /api/shipments` | 受控批次明确拒绝（`409 BATCH_QUARANTINED`） |
 | `POST /api/label-rolls/:id/consume` | 受控批次的卷暂停贴用（`409 ROLL_QUARANTINED`，不永久停用） |
+| `POST /api/label-rolls/:id/usages/:usageId/correct` | 受控批次的卷暂停核销更正（`409 ROLL_QUARANTINED`，不永久停用） |
 | `GET /api/shipments/:id/evaluation` | `current_state`/`conditions` 新增 `batch_quarantined`/`quarantine_orders`，准予判定含“未受隔离”条件 |
 | 事件 `POST/PUT/DELETE`、原料 `PUT`、补录 `POST /api/backfills`、换线 `apply` | 响应形状不变，另附 `quarantine`（本次新受控/脱离受控的批次）；级联的待评估单与需重评结论并入既有 `pending_shipments`/`stale_dispositions` |
 | 换线 `preview` 的 `diff` | 另含 `quarantine_will_control`/`quarantine_will_release`（应用后将新受控/脱离受控的批次） |
@@ -1397,6 +1484,7 @@ npm start                      # 自动创建 data/allergen.db、建表并写入
 npm test             # 校验引擎：无环/成环用例
 npm run test:replan  # 启动临时端口的真实服务，端到端验证整组预演/确认应用全部语义
 npm run test:labels  # 启动临时端口的真实服务，端到端验证标签卷登记/核销/永久停用全部语义
+npm run test:label-corrections  # 端到端验证核销更正：更正链/最新有效数量/修订号/余额同步/停用与隔离拒绝/快照不改
 npm run test:shipments # 端到端验证包装出货：余额、整单事务拒绝、快照、待评估联动与换线预测
 npm run test:evaluations # 端到端验证待评估单质量处置：评估视图/版本并发/CONTINUE 条件/只增不改/需重新评估
 npm run test:trace       # 端到端验证供应批号登记/投料批号/追溯传播（直接/引用/残留/清洗截断/未知无法排除）/更正删除更新/换线带批号/只读不改动
@@ -1480,7 +1568,7 @@ server/
   validation.js  # 全量校验（未来批次/循环/时间冲突/重复产出/事件落入停机窗口）
   downtime.js    # 设备检修停机窗口：登记/调整/取消/查询（左闭右开、同设备不重叠相邻允许、覆盖事件整次拒绝）；事件落窗核对供全量校验复用
   recompute.js   # 推导引擎：回放事件、批次并集、设备残留（全清/部分清洗按过敏原清除）、放行核对、标签卷停用核对、出货单待评估核对
-  labels.js      # 过敏原标签卷：三方一致登记、按修订号核销、永久停用
+  labels.js      # 过敏原标签卷：三方一致登记、按修订号核销、核销更正（更正链/最新有效数量）、永久停用
   shipments.js   # 包装出货：整单事务分配、快照保存、可出货余额（受控批次逐卷/合计按 0、原值保留）、待评估联动（不自动恢复）
   evaluation.js  # 待评估单质量处置：评估视图、签名状态版本、整单结论事务提交、旧结论需重评核对
   lots.js        # 原料供应批号：档案登记/标记/删除、投料批号解析（不存在/不匹配明确拒绝）
@@ -1497,6 +1585,7 @@ scripts/
   test-cycle.js      # 校验引擎单测
   test-replan.js     # 整组预演/确认应用端到端测试
   test-labels.js     # 标签卷登记/核销/停用端到端测试
+  test-label-corrections.js # 核销更正（更正链/最新有效数量/余额同步/边界与拒绝）端到端测试
   test-shipments.js  # 包装出货：余额/整单事务/快照/待评估联动端到端测试
   test-evaluations.js # 出货质量处置：评估视图/版本并发/CONTINUE 条件/只增不改/需重新评估端到端测试
   test-trace.js       # 供应批号与流向追溯：档案/投料批号/三路径传播/清洗截断/未知无法排除/更正删除/换线带批号/只读 端到端测试

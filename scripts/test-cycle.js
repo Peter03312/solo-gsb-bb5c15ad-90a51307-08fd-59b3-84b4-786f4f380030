@@ -8,8 +8,12 @@ function memDb() {
   db.exec(`CREATE TABLE equipment(id INTEGER PRIMARY KEY);
     CREATE TABLE batches(id INTEGER PRIMARY KEY, code TEXT);
     CREATE TABLE events(id INTEGER PRIMARY KEY, event_time TEXT, type TEXT, equipment_id INTEGER, batch_id INTEGER);
-    CREATE TABLE process_inputs(id INTEGER PRIMARY KEY, event_id INTEGER, material_id INTEGER, batch_id INTEGER);
-    CREATE TABLE equipment_downtime_windows(id INTEGER PRIMARY KEY, equipment_id INTEGER, start_time TEXT, end_time TEXT, reason TEXT, operator TEXT);`);
+    CREATE TABLE process_inputs(id INTEGER PRIMARY KEY, event_id INTEGER, material_id INTEGER, batch_id INTEGER, material_lot_id INTEGER, qty_grams INTEGER);
+    CREATE TABLE equipment_downtime_windows(id INTEGER PRIMARY KEY, equipment_id INTEGER, start_time TEXT, end_time TEXT, reason TEXT, operator TEXT);
+    CREATE TABLE materials(id INTEGER PRIMARY KEY, code TEXT, name TEXT, allergens TEXT DEFAULT '[]');
+    CREATE TABLE material_lots(id INTEGER PRIMARY KEY, material_id INTEGER, lot_code TEXT, status TEXT DEFAULT 'ACTIVE');
+    CREATE TABLE lot_opening_balances(id INTEGER PRIMARY KEY, lot_id INTEGER, quantity_grams INTEGER);
+    CREATE TABLE lot_inbound_receipts(id INTEGER PRIMARY KEY, lot_id INTEGER, quantity_grams INTEGER);`);
   db.prepare('INSERT INTO equipment(id) VALUES (1),(2)').run();
   return db;
 }

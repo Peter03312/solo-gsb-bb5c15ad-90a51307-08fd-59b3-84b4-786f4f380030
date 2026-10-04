@@ -978,12 +978,49 @@ app.post('/api/label-rolls/:id/consume', (req, res) => {
   } catch (err) { sendLabelError(res, err); }
 });
 
+// 核销更正：仓管更正同一标签卷的一笔贴用/作废记录。
+// body { usage_id, expected_revision, target_applied, target_voided, corrected_by?, reason?, corrected_at? }
+// 未知/跨卷核销、非法数量、旧修订号、已停用/隔离、更正后低于已分配或超印量均整次拒绝（修订号不前进）；
+// 成功返回 { correction, usage(含更正链), roll(最新有效数量) }。
+app.post('/api/label-rolls/:id/usages/:usageId/correct', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '卷号不合法' });
+  try {
+    const body = { ...(req.body || {}), usage_id: req.body && req.body.usage_id != null
+      ? req.body.usage_id : req.params.usageId };
+    res.json(labels.correctUsage(db, id, body));
+  } catch (err) { sendLabelError(res, err); }
+});
+
+// 查询一卷的全部核销记录（原核销只增不改，每条含更正链 correction_chain 与最新有效数量）。
+app.get('/api/label-rolls/:id/usages', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: '卷号不合法' });
+  try {
+    res.json(labels.listRollUsages(db, id));
+  } catch (err) { sendLabelError(res, err); }
+});
+
+// 查询单笔核销记录及其更正链。
+app.get('/api/label-rolls/:id/usages/:usageId', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const usageId = parseInt(req.params.usageId, 10);
+  if (!Number.isInteger(id) || !Number.isInteger(usageId)) {
+    return res.status(400).json({ error: '卷号或核销编号不合法' });
+  }
+  try {
+    res.json(labels.getRollUsage(db, id, usageId));
+  } catch (err) { sendLabelError(res, err); }
+});
+
 function sendLabelError(res, err) {
   if (err && err.name === 'LabelError') {
     const status = (err.code === 'REVISION_MISMATCH' || err.code === 'OVER_LIMIT' ||
       err.code === 'ROLL_RETIRED' || err.code === 'BATCH_QUARANTINED' ||
-      err.code === 'ROLL_QUARANTINED') ? 409 : 400;
-    if (err.code === 'ROLL_NOT_FOUND') return res.status(404).json({ error: err.message, code: err.code });
+      err.code === 'ROLL_QUARANTINED' || err.code === 'BELOW_ALLOCATED') ? 409 : 400;
+    if (err.code === 'ROLL_NOT_FOUND' || err.code === 'USAGE_NOT_FOUND') {
+      return res.status(404).json({ error: err.message, code: err.code });
+    }
     return res.status(status).json({
       error: err.message,
       code: err.code,
